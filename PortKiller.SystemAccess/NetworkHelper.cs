@@ -9,67 +9,76 @@ namespace PortKiller.SystemAccess
     {
         private static string? _cachedNetstatOutput;
         private static DateTime _cacheTime = DateTime.MinValue;
-        private static readonly TimeSpan CacheTimeout = TimeSpan.FromSeconds(2);
+        private static readonly TimeSpan CacheTimeout = TimeSpan.FromSeconds(1);
 
         public List<ConnectionInfo> GetActiveConnections()
         {
             var connections = new List<ConnectionInfo>();
-            var properties = IPGlobalProperties.GetIPGlobalProperties();
-
             var netstatData = GetNetstatData();
 
-            var tcpConnections = properties.GetActiveTcpConnections();
-            foreach (var connection in tcpConnections)
+            try
             {
-                var connInfo = new ConnectionInfo
-                {
-                    LocalAddress = connection.LocalEndPoint.Address.ToString(),
-                    LocalPort = connection.LocalEndPoint.Port,
-                    RemoteAddress = connection.RemoteEndPoint.Address.ToString(),
-                    RemotePort = connection.RemoteEndPoint.Port,
-                    Protocol = "TCP",
-                    State = connection.State.ToString()
-                };
+                var properties = IPGlobalProperties.GetIPGlobalProperties();
 
-                connInfo.ProcessId = GetProcessIdFromNetstat(connection.LocalEndPoint.Port, "TCP", netstatData);
-                connections.Add(connInfo);
+                var tcpConnections = properties.GetActiveTcpConnections();
+                foreach (var connection in tcpConnections)
+                {
+                    var connInfo = new ConnectionInfo
+                    {
+                        LocalAddress = connection.LocalEndPoint.Address.ToString(),
+                        LocalPort = connection.LocalEndPoint.Port,
+                        RemoteAddress = connection.RemoteEndPoint.Address.ToString(),
+                        RemotePort = connection.RemoteEndPoint.Port,
+                        Protocol = "TCP",
+                        State = connection.State.ToString()
+                    };
+
+                    connInfo.ProcessId = GetProcessIdFromNetstat(connection.LocalEndPoint.Port, "TCP", netstatData);
+                    connections.Add(connInfo);
+                }
+
+                var tcpListeners = properties.GetActiveTcpListeners();
+                foreach (var listener in tcpListeners)
+                {
+                    var connInfo = new ConnectionInfo
+                    {
+                        LocalAddress = listener.Address.ToString(),
+                        LocalPort = listener.Port,
+                        RemoteAddress = "0.0.0.0",
+                        RemotePort = 0,
+                        Protocol = "TCP",
+                        State = "LISTENING"
+                    };
+
+                    connInfo.ProcessId = GetProcessIdFromNetstat(listener.Port, "TCP", netstatData);
+                    connections.Add(connInfo);
+                }
+
+                var udpListeners = properties.GetActiveUdpListeners();
+                foreach (var listener in udpListeners)
+                {
+                    var connInfo = new ConnectionInfo
+                    {
+                        LocalAddress = listener.Address.ToString(),
+                        LocalPort = listener.Port,
+                        RemoteAddress = "0.0.0.0",
+                        RemotePort = 0,
+                        Protocol = "UDP",
+                        State = "LISTENING"
+                    };
+
+                    connInfo.ProcessId = GetProcessIdFromNetstat(listener.Port, "UDP", netstatData);
+                    connections.Add(connInfo);
+                }
+
+                connections.AddRange(GetAdditionalNetstatConnections(netstatData));
+            }
+            catch (Exception)
+            {
+                connections.AddRange(GetNetstatOnlyConnections(netstatData));
             }
 
-            var tcpListeners = properties.GetActiveTcpListeners();
-            foreach (var listener in tcpListeners)
-            {
-                var connInfo = new ConnectionInfo
-                {
-                    LocalAddress = listener.Address.ToString(),
-                    LocalPort = listener.Port,
-                    RemoteAddress = "0.0.0.0",
-                    RemotePort = 0,
-                    Protocol = "TCP",
-                    State = "LISTENING"
-                };
-
-                connInfo.ProcessId = GetProcessIdFromNetstat(listener.Port, "TCP", netstatData);
-                connections.Add(connInfo);
-            }
-
-            var udpListeners = properties.GetActiveUdpListeners();
-            foreach (var listener in udpListeners)
-            {
-                var connInfo = new ConnectionInfo
-                {
-                    LocalAddress = listener.Address.ToString(),
-                    LocalPort = listener.Port,
-                    RemoteAddress = "0.0.0.0",
-                    RemotePort = 0,
-                    Protocol = "UDP",
-                    State = "LISTENING"
-                };
-
-                connInfo.ProcessId = GetProcessIdFromNetstat(listener.Port, "UDP", netstatData);
-                connections.Add(connInfo);
-            }
-
-            return connections;
+            return connections.DistinctBy(c => new { c.LocalPort, c.Protocol, c.State }).ToList();
         }
 
         public List<ProcessInfo> GetProcessesByPort(int port)
@@ -124,7 +133,7 @@ namespace PortKiller.SystemAccess
                 if (process == null) return string.Empty;
 
                 var output = process.StandardOutput.ReadToEnd();
-                if (!process.WaitForExit(5000))
+                if (!process.WaitForExit(8000))
                 {
                     process.Kill();
                     return string.Empty;
@@ -138,6 +147,136 @@ namespace PortKiller.SystemAccess
             {
                 return string.Empty;
             }
+        }
+
+        private List<ConnectionInfo> GetAdditionalNetstatConnections(string netstatOutput)
+        {
+            var connections = new List<ConnectionInfo>();
+            
+            if (string.IsNullOrEmpty(netstatOutput))
+                return connections;
+
+            try
+            {
+                var lines = netstatOutput.Split('\n');
+                foreach (var line in lines)
+                {
+                    var trimmedLine = line.Trim();
+                    if (string.IsNullOrEmpty(trimmedLine) || 
+                        !trimmedLine.Contains("LISTENING") && !trimmedLine.Contains("ESTABLISHED"))
+                        continue;
+
+                    var parts = trimmedLine.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length < 4) continue;
+
+                    var protocol = parts[0].ToUpper();
+                    if (protocol != "TCP" && protocol != "UDP") continue;
+
+                    var localAddress = parts[1];
+                    var colonIndex = localAddress.LastIndexOf(':');
+                    if (colonIndex == -1) continue;
+
+                    if (!int.TryParse(localAddress.Substring(colonIndex + 1), out int port))
+                        continue;
+
+                    var state = protocol == "UDP" ? "LISTENING" : (parts.Length > 3 ? parts[3] : "UNKNOWN");
+                    var pidIndex = protocol == "TCP" ? 4 : 3;
+                    int processId = 0;
+                    
+                    if (parts.Length > pidIndex && int.TryParse(parts[pidIndex], out int pid))
+                        processId = pid;
+
+                    var connInfo = new ConnectionInfo
+                    {
+                        LocalAddress = localAddress.Substring(0, colonIndex),
+                        LocalPort = port,
+                        RemoteAddress = "0.0.0.0",
+                        RemotePort = 0,
+                        Protocol = protocol,
+                        State = state,
+                        ProcessId = processId
+                    };
+
+                    connections.Add(connInfo);
+                }
+            }
+            catch (Exception)
+            {
+            }
+
+            return connections;
+        }
+
+        private List<ConnectionInfo> GetNetstatOnlyConnections(string netstatOutput)
+        {
+            var connections = new List<ConnectionInfo>();
+            
+            if (string.IsNullOrEmpty(netstatOutput))
+                return connections;
+
+            try
+            {
+                var lines = netstatOutput.Split('\n');
+                foreach (var line in lines)
+                {
+                    var trimmedLine = line.Trim();
+                    if (string.IsNullOrEmpty(trimmedLine)) continue;
+
+                    var parts = trimmedLine.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length < 4) continue;
+
+                    var protocol = parts[0].ToUpper();
+                    if (protocol != "TCP" && protocol != "UDP") continue;
+
+                    var localAddress = parts[1];
+                    var colonIndex = localAddress.LastIndexOf(':');
+                    if (colonIndex == -1) continue;
+
+                    if (!int.TryParse(localAddress.Substring(colonIndex + 1), out int port))
+                        continue;
+
+                    var remoteAddress = parts.Length > 2 ? parts[2] : "0.0.0.0:0";
+                    var remoteColonIndex = remoteAddress.LastIndexOf(':');
+                    var remoteIp = remoteColonIndex > 0 ? remoteAddress.Substring(0, remoteColonIndex) : "0.0.0.0";
+                    int.TryParse(remoteColonIndex > 0 ? remoteAddress.Substring(remoteColonIndex + 1) : "0", out int remotePort);
+
+                    var state = "UNKNOWN";
+                    var pidIndex = -1;
+
+                    if (protocol == "TCP" && parts.Length >= 4)
+                    {
+                        state = parts[3];
+                        pidIndex = 4;
+                    }
+                    else if (protocol == "UDP")
+                    {
+                        state = "LISTENING";
+                        pidIndex = 3;
+                    }
+
+                    int processId = 0;
+                    if (pidIndex > 0 && parts.Length > pidIndex && int.TryParse(parts[pidIndex], out int pid))
+                        processId = pid;
+
+                    var connInfo = new ConnectionInfo
+                    {
+                        LocalAddress = localAddress.Substring(0, colonIndex),
+                        LocalPort = port,
+                        RemoteAddress = remoteIp,
+                        RemotePort = remotePort,
+                        Protocol = protocol,
+                        State = state,
+                        ProcessId = processId
+                    };
+
+                    connections.Add(connInfo);
+                }
+            }
+            catch (Exception)
+            {
+            }
+
+            return connections;
         }
 
         private int GetProcessIdFromNetstat(int port, string protocol, string netstatOutput)
